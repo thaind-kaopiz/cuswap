@@ -380,12 +380,40 @@ def doctor(
 
 @app.command("export")
 def export_cmd(path: Path = typer.Argument(..., help="Output JSON path")) -> None:
-    """Export all saved accounts (contains session tokens — keep private)."""
+    """Export saved sessions so another machine can import them without logging in."""
     index = store.load_index()
     if not index.accounts:
         _fail("Nothing to export.")
-    store.export_accounts(path, index)
-    console.print(f"Wrote {path}")
+    try:
+        count = store.export_accounts(path, index)
+    except StoreError as exc:
+        _fail(str(exc))
+    console.print(f"Exported {count} account(s) to {path}")
+    console.print("[yellow]This file contains session tokens. Keep it private and do not commit it.[/]")
+
+
+@app.command("import")
+def import_cmd(
+    path: Path = typer.Argument(..., help="Export JSON from this or another machine"),
+    replace: bool = typer.Option(
+        False,
+        "--replace",
+        help="Delete accounts already saved on this machine, then import the file.",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Do not prompt when using --replace."),
+) -> None:
+    """Import sessions from an export file. Does not switch the open Cursor window."""
+    if replace and not yes and not Confirm.ask(
+        "Replace all saved accounts on this machine with the file?",
+        default=False,
+    ):
+        raise typer.Exit()
+    try:
+        added, updated = store.import_accounts(path, replace=replace)
+    except StoreError as exc:
+        _fail(str(exc))
+    console.print(f"Imported {added} new account(s), updated {updated}.")
+    console.print("Run `cuswap list`, then `cuswap switch <slot>` to use one. Cursor stays as-is until then.")
 
 
 @app.command("purge")
@@ -412,6 +440,8 @@ def help_cmd() -> None:
         "  cuswap watch             Live usage dashboard\n"
         "  cuswap auto              Switch when usage hits the threshold\n"
         "  cuswap doctor            Check local Cursor paths\n"
+        "  cuswap export <file>     Save sessions for another machine (contains tokens)\n"
+        "  cuswap import <file>     Restore those sessions without logging in again\n"
         "\nRun cuswap COMMAND --help for details."
     )
 

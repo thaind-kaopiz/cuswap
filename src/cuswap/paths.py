@@ -97,6 +97,18 @@ def cursor_cli_dir() -> Path:
     return Path.home() / ".config" / "cursor"
 
 
+def resolve_sidecar(name_or_path: str) -> Path:
+    """Map an export sidecar name onto this machine. Absolute paths stay put."""
+    path = Path(name_or_path)
+    if path.is_absolute():
+        return path
+    name = path.name
+    for candidate in sidecar_candidates():
+        if candidate.name == name:
+            return candidate
+    return cursor_home() / name
+
+
 def sidecar_candidates() -> list[Path]:
     home = cursor_home()
     cli = cursor_cli_dir()

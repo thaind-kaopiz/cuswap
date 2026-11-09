@@ -33,6 +33,8 @@ cli-config.json
 statsig-cache.json
 *backup*.json
 export*.json
+*export*.json
+cuswap-export.json
 
 # Local debug scripts that may print tokens
 _inspect_*.py

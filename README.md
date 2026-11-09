@@ -94,7 +94,9 @@ cuswap switch 2 --no-restart
 | `cuswap tui` | Menu tương tác |
 | `cuswap doctor` | Kiểm tra path / session |
 | `cuswap doctor --repair` | Sửa `state.vscdb` bị corrupt (phải tắt Cursor) |
-| `cuswap export backup.json` | Export (chứa token — giữ kín) |
+| `cuswap export backup.json` | Xuất session để chuyển máy (chứa token — giữ kín) |
+| `cuswap import backup.json` | Nhập session, không cần login lại |
+| `cuswap import backup.json --replace` | Xóa account trên máy này rồi nhập đúng bộ trong file |
 | `cuswap purge` | Xóa toàn bộ data cuswap |
 
 `list`, `status`, `switch` hỗ trợ `--json` cho script.
@@ -126,6 +128,26 @@ Data của tool:
 | Linux | `~/.local/share/cuswap/` |
 
 Ghi đè bằng biến môi trường `CUSWAP_HOME`.
+
+## Chuyển account sang máy khác
+
+Trên máy đang có sẵn account:
+
+```bash
+cuswap export cuswap-export.json
+```
+
+Copy file đó sang máy kia bằng USB hoặc thư mục riêng. Đừng commit và đừng gửi file này — bên trong là access token và refresh token.
+
+Trên máy mới, sau khi cài cuswap:
+
+```bash
+cuswap import cuswap-export.json
+cuswap list
+cuswap switch 2
+```
+
+`import` chỉ ghi session vào cuswap. Cursor đang mở không đổi cho đến khi `cuswap switch`. Email đã có trên máy đích được cập nhật session, email mới được thêm. Token còn hạn thì không cần đăng nhập lại từng account.
 
 ## Lưu ý
 

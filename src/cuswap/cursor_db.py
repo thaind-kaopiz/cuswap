@@ -6,7 +6,7 @@ from pathlib import Path
 
 from cuswap.fsutil import replace_with_retry
 from cuswap.models import EncodedKey, SessionBundle
-from cuswap.paths import is_auth_key, sidecar_candidates, state_db_path
+from cuswap.paths import is_auth_key, resolve_sidecar, sidecar_candidates, state_db_path
 from cuswap.sealed import apply_plaintext_tokens
 
 
@@ -340,7 +340,7 @@ def clear_auth(db_path: Path | None = None) -> None:
 
 def _write_sidecars(bundle: SessionBundle) -> None:
     for sidecar_path, content in bundle.sidecars.items():
-        target = Path(sidecar_path)
+        target = resolve_sidecar(sidecar_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".cuswap-tmp")
         tmp.write_text(content, encoding="utf-8")
