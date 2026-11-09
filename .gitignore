@@ -1,0 +1,39 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment files and local secrets
+.env
+.env.*
+*.env
+.envrc
+env.local
+env/*.local
+*.local
+
+# Live account data and session tokens (never commit)
+credentials/
+accounts.json
+usage-cache.json
+settings.json
+pending-switch.bin
+switch.log
+*.bin
+*.vscdb
+*.vscdb-*
+auth.json
+cli-config.json
+statsig-cache.json
+*backup*.json
+export*.json
+
+# Local debug scripts that may print tokens
+_inspect_*.py
+_probe_*.py
