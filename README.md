@@ -1,5 +1,7 @@
 # cuswap
 
+[**EN**](README.en.md) | **VI**
+
 Công cụ CLI quản lý nhiều tài khoản **Cursor IDE** trên máy local — giống [claude-swap](https://github.com/realiti4/claude-swap) (`cswap`), nhưng dành cho Cursor.
 
 - Xem danh sách tài khoản, plan, usage, trạng thái
