@@ -19,6 +19,19 @@ CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
+TH32CS_SNAPPROCESS = 0x00000002
+PROCESS_TERMINATE = 0x0001
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+WM_CLOSE = 0x0010
+SMTO_ABORTIFHUNG = 0x0002
+
+
+def _hidden_kwargs() -> dict:
+    """Prevent console apps (taskkill/tasklist) from flashing a CMD window."""
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": CREATE_NO_WINDOW}
+
 
 def cursor_pids() -> list[int]:
     if sys.platform == "win32":
@@ -50,15 +63,75 @@ def cursor_pids() -> list[int]:
 
 
 def _win_cursor_pids() -> list[int]:
+    try:
+        return _win_toolhelp_pids("cursor.exe")
+    except OSError:
+        return _win_tasklist_pids()
+
+
+def _win_toolhelp_pids(image_name: str) -> list[int]:
+    """List PIDs via Toolhelp — no console window."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+    CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+    Process32FirstW = kernel32.Process32FirstW
+    Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    Process32FirstW.restype = wintypes.BOOL
+
+    Process32NextW = kernel32.Process32NextW
+    Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    Process32NextW.restype = wintypes.BOOL
+
+    invalid = ctypes.c_void_p(-1).value
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snapshot or snapshot == invalid:
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+    pids: list[int] = []
+    try:
+        more = Process32FirstW(snapshot, ctypes.byref(entry))
+        target = image_name.lower()
+        while more:
+            if entry.szExeFile.lower() == target:
+                pids.append(int(entry.th32ProcessID))
+            more = Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return pids
+
+
+def _win_tasklist_pids() -> list[int]:
     result = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/FO", "CSV", "/NH"],
         capture_output=True,
         text=True,
         check=False,
+        **_hidden_kwargs(),
     )
     pids: list[int] = []
     for line in (result.stdout or "").splitlines():
-        # "Cursor.exe","1234","Session Name","Session#","Mem Usage"
         parts = [part.strip().strip('"') for part in line.split(",")]
         if len(parts) >= 2 and parts[0].lower() == "cursor.exe" and parts[1].isdigit():
             pids.append(int(parts[1]))
@@ -76,8 +149,7 @@ def quit_cursor(*, timeout: float = 12.0, force: bool = True) -> None:
         return
 
     if sys.platform == "win32":
-        # Soft close first so windows can flush.
-        subprocess.run(["taskkill", "/IM", "Cursor.exe"], capture_output=True, check=False)
+        _win_soft_close_cursor()
     else:
         subprocess.run(["pkill", "-x", "Cursor"], capture_output=True, check=False)
         subprocess.run(["pkill", "-x", "cursor"], capture_output=True, check=False)
@@ -93,15 +165,7 @@ def quit_cursor(*, timeout: float = 12.0, force: bool = True) -> None:
         raise CursorProcessError("Cursor is still running")
 
     if sys.platform == "win32":
-        # Force every remaining PID. Do not use /T — that can kill the
-        # pythonw helper if it is still loosely attached to a job.
-        for pid in cursor_pids():
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True,
-                check=False,
-            )
-        subprocess.run(["taskkill", "/F", "/IM", "Cursor.exe"], capture_output=True, check=False)
+        _win_force_kill_cursor()
     else:
         subprocess.run(["pkill", "-9", "-x", "Cursor"], capture_output=True, check=False)
         subprocess.run(["pkill", "-9", "-x", "cursor"], capture_output=True, check=False)
@@ -118,6 +182,102 @@ def quit_cursor(*, timeout: float = 12.0, force: bool = True) -> None:
             f"Could not quit Cursor (still running: {cursor_pids()})"
         )
     _wait_for_db_writable(timeout=3.0)
+
+
+def _win_soft_close_cursor() -> None:
+    """Ask Cursor windows to close via WM_CLOSE — no taskkill console."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+    GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    GetWindowThreadProcessId.restype = wintypes.DWORD
+
+    IsWindowVisible = user32.IsWindowVisible
+    IsWindowVisible.argtypes = [wintypes.HWND]
+    IsWindowVisible.restype = wintypes.BOOL
+
+    SendMessageTimeoutW = user32.SendMessageTimeoutW
+    SendMessageTimeoutW.argtypes = [
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+        wintypes.UINT,
+        wintypes.UINT,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    SendMessageTimeoutW.restype = ctypes.c_size_t
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    EnumWindows = user32.EnumWindows
+    EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
+    EnumWindows.restype = wintypes.BOOL
+
+    target_pids = set(cursor_pids())
+    if not target_pids:
+        return
+
+    def _callback(hwnd: int, _lparam: int) -> bool:
+        pid = wintypes.DWORD()
+        GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in target_pids and IsWindowVisible(hwnd):
+            result = ctypes.c_size_t()
+            SendMessageTimeoutW(
+                hwnd,
+                WM_CLOSE,
+                0,
+                0,
+                SMTO_ABORTIFHUNG,
+                500,
+                ctypes.byref(result),
+            )
+        return True
+
+    EnumWindows(EnumWindowsProc(_callback), 0)
+    # Headless / tray processes: soft signal without a visible console.
+    subprocess.run(
+        ["taskkill", "/IM", "Cursor.exe"],
+        capture_output=True,
+        check=False,
+        **_hidden_kwargs(),
+    )
+
+
+def _win_force_kill_cursor() -> None:
+    """Terminate remaining Cursor.exe PIDs via Win32 — no CMD flash."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    OpenProcess = kernel32.OpenProcess
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenProcess.restype = wintypes.HANDLE
+    TerminateProcess = kernel32.TerminateProcess
+    TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    TerminateProcess.restype = wintypes.BOOL
+
+    for pid in cursor_pids():
+        handle = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            handle = OpenProcess(PROCESS_TERMINATE, False, pid)
+        if not handle:
+            continue
+        try:
+            TerminateProcess(handle, 1)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    # Fallback for any leftover (still hidden).
+    if cursor_pids():
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "Cursor.exe"],
+            capture_output=True,
+            check=False,
+            **_hidden_kwargs(),
+        )
 
 
 def spawn_detached(argv: list[str]) -> None:
@@ -149,7 +309,6 @@ def _spawn_windows(argv: list[str]) -> None:
         with log.open("a", encoding="utf-8") as handle:
             handle.write(f"CreateProcess failed: {exc}\n")
 
-    # Fallback: DETACHED pythonw — still no PowerShell console flash.
     log_handle = log.open("a", encoding="utf-8")
     subprocess.Popen(
         argv,
