@@ -43,17 +43,12 @@ def helper_python() -> Path:
 
 
 def helper_argv() -> list[str]:
-    # Never reuse cuswap.exe — the console shim opens a blank CMD and can
-    # stay inside Cursor's process job, so taskkill kills the helper too.
+    # Never reuse cuswap.exe — the console shim opens a blank CMD.
     return [str(helper_python()), "-m", "cuswap.apply_switch"]
 
 
 def _verify_email() -> str | None:
-    try:
-        live = cursor_db.read_live_bundle()
-    except cursor_db.CursorDbError:
-        return None
-    return live.get("cursorAuth/cachedEmail")
+    return cursor_db.read_text_key("cursorAuth/cachedEmail")
 
 
 def run() -> int:
@@ -67,31 +62,45 @@ def run() -> int:
     email = str(payload.get("email") or "")
     restart = bool(payload.get("restart", True))
     bundle = SessionBundle.from_dict(payload.get("bundle") or {})
-    _log(f"target={email} restart={restart}")
+    _log(f"target={email} restart={restart} pids_before={cursor_proc.cursor_pids()}")
 
-    time.sleep(1.0)
+    time.sleep(0.2)
     try:
-        cursor_proc.quit_cursor(timeout=20, force=True)
-        _log("cursor quit")
+        cursor_proc.quit_cursor(timeout=12, force=True)
+        _log(f"cursor quit; pids_after={cursor_proc.cursor_pids()}")
     except Exception as exc:  # noqa: BLE001
-        _log(f"quit warning: {exc}")
+        _log(f"quit warning: {exc}; pids={cursor_proc.cursor_pids()}")
+        # Last resort: force again so the DB unlocks.
+        try:
+            cursor_proc.quit_cursor(timeout=8, force=True)
+            _log(f"cursor force-quit retry; pids={cursor_proc.cursor_pids()}")
+        except Exception as retry_exc:  # noqa: BLE001
+            _log(f"quit failed: {retry_exc}")
+            return 4
 
     last_error = "write not attempted"
-    for attempt in range(1, 8):
+    for attempt in range(1, 6):
         try:
-            cursor_db.wait_until_writable(timeout=8.0)
-            info = cursor_db.inspect_storage()
-            _log(f"storage attempt {attempt}: {info}")
-            if info.get("status") not in {"ok", "degraded"}:
-                note = cursor_db.repair_state_db()
-                _log(f"repaired storage: {note}")
             cursor_db.write_bundle(bundle)
             last_error = ""
             break
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
             _log(f"write attempt {attempt} failed: {exc}")
-            time.sleep(1.2)
+            if attempt == 1:
+                try:
+                    if cursor_db.clear_stale_wal():
+                        _log("cleared stale wal/shm")
+                except Exception as repair_exc:  # noqa: BLE001
+                    _log(f"wal clear skipped: {repair_exc}")
+            # Remaining Cursor process holding the lock?
+            if cursor_proc.is_running():
+                _log(f"cursor still running during write: {cursor_proc.cursor_pids()}")
+                try:
+                    cursor_proc.quit_cursor(timeout=6, force=True)
+                except Exception as quit_exc:  # noqa: BLE001
+                    _log(f"re-quit failed: {quit_exc}")
+            time.sleep(0.5)
     if last_error:
         _log(f"write failed: {last_error}")
         return 2
@@ -102,8 +111,13 @@ def run() -> int:
         _log("verify mismatch; rewriting")
         try:
             cursor_db.write_bundle(bundle)
+            actual = _verify_email()
+            _log(f"rewrote email={actual}")
         except Exception as exc:  # noqa: BLE001
             _log(f"rewrite failed: {exc}")
+            return 2
+        if email and actual and actual.lower() != email.lower():
+            _log("verify still mismatched after rewrite")
             return 2
 
     pending_switch_path().unlink(missing_ok=True)

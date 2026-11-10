@@ -14,74 +14,114 @@ class CursorProcessError(RuntimeError):
     pass
 
 
-def _win_cursor_running() -> bool:
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/FO", "CSV", "/NH"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return "Cursor.exe" in (result.stdout or "")
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+CREATE_NO_WINDOW = 0x08000000
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
-def is_running() -> bool:
+def cursor_pids() -> list[int]:
     if sys.platform == "win32":
-        return _win_cursor_running()
+        return _win_cursor_pids()
     result = subprocess.run(
         ["pgrep", "-x", "Cursor"],
         capture_output=True,
         text=True,
         check=False,
     )
+    pids: list[int] = []
     if result.returncode == 0:
-        return True
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
     result = subprocess.run(
         ["pgrep", "-x", "cursor"],
         capture_output=True,
         text=True,
         check=False,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+    return sorted(set(pids))
 
 
-def quit_cursor(*, timeout: float = 20.0, force: bool = True) -> None:
+def _win_cursor_pids() -> list[int]:
+    result = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq Cursor.exe", "/FO", "CSV", "/NH"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        # "Cursor.exe","1234","Session Name","Session#","Mem Usage"
+        parts = [part.strip().strip('"') for part in line.split(",")]
+        if len(parts) >= 2 and parts[0].lower() == "cursor.exe" and parts[1].isdigit():
+            pids.append(int(parts[1]))
+    return pids
+
+
+def is_running() -> bool:
+    return bool(cursor_pids())
+
+
+def quit_cursor(*, timeout: float = 12.0, force: bool = True) -> None:
+    """Close every Cursor process. Soft close alone only drops one window."""
     if not is_running():
-        _wait_for_db_writable(timeout=6.0)
+        _wait_for_db_writable(timeout=2.0)
         return
+
     if sys.platform == "win32":
-        # Do not use /T — that kills the switch helper if it is still
-        # loosely attached to Cursor's process tree.
+        # Soft close first so windows can flush.
         subprocess.run(["taskkill", "/IM", "Cursor.exe"], capture_output=True, check=False)
     else:
         subprocess.run(["pkill", "-x", "Cursor"], capture_output=True, check=False)
         subprocess.run(["pkill", "-x", "cursor"], capture_output=True, check=False)
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    soft_deadline = time.time() + min(2.5, timeout / 2)
+    while time.time() < soft_deadline:
         if not is_running():
-            _wait_for_db_writable(timeout=8.0)
+            _wait_for_db_writable(timeout=3.0)
             return
-        time.sleep(0.4)
+        time.sleep(0.2)
 
     if not force:
         raise CursorProcessError("Cursor is still running")
+
     if sys.platform == "win32":
+        # Force every remaining PID. Do not use /T — that can kill the
+        # pythonw helper if it is still loosely attached to a job.
+        for pid in cursor_pids():
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                check=False,
+            )
         subprocess.run(["taskkill", "/F", "/IM", "Cursor.exe"], capture_output=True, check=False)
     else:
         subprocess.run(["pkill", "-9", "-x", "Cursor"], capture_output=True, check=False)
         subprocess.run(["pkill", "-9", "-x", "cursor"], capture_output=True, check=False)
-    time.sleep(0.8)
+
+    deadline = time.time() + max(3.0, timeout - 2.5)
+    while time.time() < deadline:
+        if not is_running():
+            _wait_for_db_writable(timeout=3.0)
+            return
+        time.sleep(0.2)
+
     if is_running():
-        raise CursorProcessError("Could not quit Cursor")
-    _wait_for_db_writable(timeout=8.0)
-
-
-CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-CREATE_NO_WINDOW = 0x08000000
+        raise CursorProcessError(
+            f"Could not quit Cursor (still running: {cursor_pids()})"
+        )
+    _wait_for_db_writable(timeout=3.0)
 
 
 def spawn_detached(argv: list[str]) -> None:
-    """Start a process that survives Cursor being killed (job-object breakaway)."""
+    """Start a process that survives Cursor being killed."""
     if sys.platform == "win32":
         _spawn_windows(argv)
         return
@@ -97,35 +137,19 @@ def spawn_detached(argv: list[str]) -> None:
 
 
 def _spawn_windows(argv: list[str]) -> None:
+    """Launch without a console window (no flashing CMD)."""
     from cuswap.paths import switch_log_path
 
     log = switch_log_path()
     log.parent.mkdir(parents=True, exist_ok=True)
-    # Start-Process creates a process outside Cursor's job object, so the
-    # helper keeps running after the IDE is killed.
-    exe, *args = argv
-    quoted_args = ",".join(f"'{item}'" for item in args)
-    command = (
-        f"Start-Process -FilePath '{exe}' -ArgumentList {quoted_args} "
-        f"-WorkingDirectory '{Path.home()}' -WindowStyle Hidden"
-    )
-    result = subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            command,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode == 0:
+    try:
+        _create_process_no_window(argv)
         return
-    with log.open("a", encoding="utf-8") as handle:
-        handle.write(f"powershell start failed: {result.stderr or result.stdout}\n")
+    except OSError as exc:
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"CreateProcess failed: {exc}\n")
+
+    # Fallback: DETACHED pythonw — still no PowerShell console flash.
     log_handle = log.open("a", encoding="utf-8")
     subprocess.Popen(
         argv,
@@ -134,13 +158,77 @@ def _spawn_windows(argv: list[str]) -> None:
         stdout=log_handle,
         stderr=log_handle,
         creationflags=(
-            subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NEW_PROCESS_GROUP
+            DETACHED_PROCESS
+            | CREATE_NEW_PROCESS_GROUP
             | CREATE_BREAKAWAY_FROM_JOB
             | CREATE_NO_WINDOW
         ),
         close_fds=False,
     )
+
+
+def _create_process_no_window(argv: list[str]) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class STARTUPINFO(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("hProcess", wintypes.HANDLE),
+            ("hThread", wintypes.HANDLE),
+            ("dwProcessId", wintypes.DWORD),
+            ("dwThreadId", wintypes.DWORD),
+        ]
+
+    command = subprocess.list2cmdline(argv)
+    startup = STARTUPINFO()
+    startup.cb = ctypes.sizeof(STARTUPINFO)
+    process_info = PROCESS_INFORMATION()
+    flags = (
+        DETACHED_PROCESS
+        | CREATE_NEW_PROCESS_GROUP
+        | CREATE_BREAKAWAY_FROM_JOB
+        | CREATE_NO_WINDOW
+    )
+    created = kernel32.CreateProcessW(
+        None,
+        ctypes.c_wchar_p(command),
+        None,
+        None,
+        False,
+        flags,
+        None,
+        str(Path.home()),
+        ctypes.byref(startup),
+        ctypes.byref(process_info),
+    )
+    if not created:
+        raise OSError(ctypes.get_last_error(), "CreateProcessW failed")
+    kernel32.CloseHandle(process_info.hThread)
+    kernel32.CloseHandle(process_info.hProcess)
 
 
 def start_cursor() -> None:
@@ -156,14 +244,13 @@ def start_cursor() -> None:
 
 
 def _launch_gui(exe: Path) -> None:
-    # DETACHED_PROCESS makes Electron/Cursor open Chrome without a URL.
     if sys.platform == "win32":
         os.startfile(str(exe))  # noqa: S606
         return
     subprocess.Popen([str(exe)], start_new_session=True, cwd=str(Path.home()))
 
 
-def _wait_for_db_writable(*, timeout: float = 8.0) -> None:
+def _wait_for_db_writable(*, timeout: float = 3.0) -> None:
     from cuswap.cursor_db import CursorDbError, wait_until_writable
 
     db = state_db_path()
@@ -172,5 +259,4 @@ def _wait_for_db_writable(*, timeout: float = 8.0) -> None:
     try:
         wait_until_writable(db, timeout=timeout)
     except CursorDbError:
-        # Caller still attempts the write; it will raise a clearer error.
         return

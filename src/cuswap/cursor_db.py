@@ -287,12 +287,47 @@ def _checkpoint(conn: sqlite3.Connection) -> None:
         return
 
 
+def read_text_key(key: str, db_path: Path | None = None) -> str | None:
+    """Fast single-key read — never runs PRAGMA quick_check / full table scan."""
+    path = db_path or state_db_path()
+    if not path.is_file():
+        return None
+    uri = f"file:{path.as_posix()}?mode=ro&immutable=1"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=2.0) as conn:
+            row = conn.execute(
+                "SELECT value FROM ItemTable WHERE key = ?", (key,)
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    encoded = encode_value(row[0])
+    if encoded is None:
+        return None
+    value = decode_value(encoded)
+    return value if isinstance(value, str) else None
+
+
+def clear_stale_wal(db_path: Path | None = None) -> bool:
+    """Drop -wal/-shm without scanning the multi-GB DB. Safe when Cursor is closed."""
+    path = db_path or state_db_path()
+    removed = False
+    for sidecar in (wal_path(path), shm_path(path)):
+        if sidecar.exists():
+            _unlink_quiet(sidecar)
+            removed = True
+    return removed
+
+
 def write_bundle(bundle: SessionBundle, db_path: Path | None = None) -> None:
     """Patch auth keys in-place. Never copy/replace the whole vscdb or its WAL/SHM.
 
     Copying state.vscdb together with -wal/-shm (or leaving a stale -shm next to
     a replaced main file) is what makes Cursor rename the DB to
     state.vscdb.corrupted.* on the next launch.
+
+    Hot path skips PRAGMA quick_check — that can take minutes on a multi-GB DB.
     """
     path = db_path or state_db_path()
     if not path.is_file():
@@ -300,11 +335,26 @@ def write_bundle(bundle: SessionBundle, db_path: Path | None = None) -> None:
     if not bundle.keys:
         raise CursorDbError("Refusing to write an empty auth bundle")
 
-    status = db_status(path)
-    if status not in {"ok", "degraded"}:
-        repair_state_db(path)
     wait_until_writable(path, timeout=20.0)
+    try:
+        _write_bundle_once(bundle, path)
+    except sqlite3.DatabaseError:
+        clear_stale_wal(path)
+        wait_until_writable(path, timeout=10.0)
+        try:
+            _write_bundle_once(bundle, path)
+        except sqlite3.DatabaseError as exc:
+            if not _itemtable_usable(path):
+                repair_state_db(path)
+                wait_until_writable(path, timeout=10.0)
+                _write_bundle_once(bundle, path)
+            else:
+                raise CursorDbError(f"Could not write Cursor state DB: {exc}") from exc
 
+    _write_sidecars(bundle)
+
+
+def _write_bundle_once(bundle: SessionBundle, path: Path) -> None:
     conn = _connect_rw(path)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -314,17 +364,21 @@ def write_bundle(bundle: SessionBundle, db_path: Path | None = None) -> None:
     finally:
         conn.close()
 
-    _write_sidecars(bundle)
-
 
 def clear_auth(db_path: Path | None = None) -> None:
     path = db_path or state_db_path()
     if not path.is_file():
         raise CursorDbError(f"Cursor state DB not found: {path}")
-    status = db_status(path)
-    if status not in {"ok", "degraded"}:
-        repair_state_db(path)
     wait_until_writable(path, timeout=20.0)
+    try:
+        _clear_auth_once(path)
+    except sqlite3.DatabaseError:
+        clear_stale_wal(path)
+        wait_until_writable(path, timeout=10.0)
+        _clear_auth_once(path)
+
+
+def _clear_auth_once(path: Path) -> None:
     conn = _connect_rw(path)
     try:
         conn.execute("BEGIN IMMEDIATE")
